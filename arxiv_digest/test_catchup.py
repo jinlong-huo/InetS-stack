@@ -52,11 +52,11 @@ def make_entry(arxiv_id, title, summary):
     )
 
 
-# ── 论文文本（分数由 config.KEYWORDS 决定，注释为当前预期分）─────────
-# 27 分: llm(6) + serving(7) + kv cache(7) + prefill(7)
+# ── 论文文本（分数由 filter 的加权/去重规则决定，不写死具体分值）─────
+# 高分：覆盖 llm / serving / kv cache / prefill
 RICH_TITLE = "KV Cache Management for LLM Serving"
 RICH_SUMMARY = "A system for llm serving with kv cache and prefill."
-# 6 分: gpu(4) + memory(2) — 达线 (≥MIN_SCORE) 但低于补遗线 (<12)
+# 低分：仅 gpu + memory — 达线但低于补遗线
 THIN_TITLE = "GPU Memory Notes"
 THIN_SUMMARY = "A short note on gpu memory."
 # 0 分: 零关键词

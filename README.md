@@ -81,12 +81,42 @@ group-toolkit/
 
 ## 🔍 arXiv Daily Digest
 
-每天自动从 arXiv 抓取最新论文，按关键词打分排序，选出最相关的 top-15 发送到邮箱。
+每天自动从 arXiv 抓取最新论文，按“相关性 + 核心/创新信号”排序，选出最相关的 top-15 发送到邮箱。
 
 **❗ 注意关键词选取和对应权重设置，直接关乎筛选文章质量。**
-可以配合 Semantic Scholar、Hugging Face Daily Papers 等其他推荐源使用。
 
-**关注方向**：LLM 推理 / GPU 数据中心 / RDMA 网络 / 光交换 (OCS) / 调度与资源分配
+**关注方向**：LLM 推理 / GPU 数据中心 / RDMA 网络 / 光交换 (OCS) / 调度与资源分配 /
+光数据中心可靠性（failure、circuit remapping、collective remapping）。
+
+打分优先 **core / innovative** 论文：标题命中加权、同一概念的同义词只计一次、
+综述/教程降权、`we propose / novel / prototype` 等贡献措辞小额加分。
+OCS spotlight 是 **software-first**：控制面、调度、路由、重配置、可靠性、
+故障恢复、collective remapping 全额计分；硅光/MEMS/WSS/调制器等器件词降权，
+纯器件论文最多 2 篇，且排序时软件论文永远排在器件论文之前。
+
+Digest 现在给出**完整摘要**、作者（过多时前 8 位 + et al.）、主分类、提交日期、
+arXiv/PDF 链接、命中原因（关键词 + 权重 + 是否标题命中）、HF upvotes 和
+OpenAlex/Semantic Scholar 引用数/TLDR（有数据时）。不是只给一个 400 字摘要片段。
+
+### 数据源与抓取可靠性
+
+| 源 | 是否需要 key | 作用 |
+| --- | --- | --- |
+| arXiv API | 否 | 主源：按分类 + 日期窗口抓取 |
+| arXiv advanced search HTML | 否 | API 429/超时时的自动回退，支持真实日期范围和完整摘要 |
+| OpenAlex | 否 | 无 key 的 bibliographic 回退，arXiv search 被限流时仍能按日期+主题找到论文 |
+| Hugging Face Daily Papers | 否 | 第二个发现源，补充 ML systems 论文 |
+| Semantic Scholar | 是（`SEMANTIC_SCHOLAR_API_KEY`） | 发现 + 引用数/TLDR enrichment |
+
+抓取层把 **“当天没有论文”** 和 **“抓取失败”** 分开：只有带
+`opensearch:totalResults` 的合法 Atom feed 才允许判空；代理登录页、HTML
+拦截页、超时、429 都算失败。任一分类失败会触发 HTML 回退；全部分类失败
+且没有回退结果时，程序以非零退出码结束，并写 `arxiv_digest/fetch_report.json`，
+不会再生成一个看起来正常的空 digest。
+
+`--date YYYY-MM-DD` 现在只抓**这一天**（旧实现会悄悄抓最近 3 天，容易让
+更早的论文挤掉目标日的论文）。补一段日期用 `--from/--to`。
+
 
 ### 快速开始
 
@@ -113,13 +143,45 @@ export ARXIV_DIGEST_EMAIL_PASSWORD="你的Gmail应用专用密码"
 python3 arxiv_digest/Arxiv_filter.py --send
 ```
 
+常用参数：
+
+```bash
+python3 arxiv_digest/Arxiv_filter.py --date 2026-10-13       # 只回填这一天
+python3 arxiv_digest/Arxiv_filter.py --from 2026-10-01 --to 2026-10-13
+python3 arxiv_digest/Arxiv_filter.py --ignore-seen           # 重评历史窗口
+python3 arxiv_digest/Arxiv_filter.py --wait                  # 429 时等待重试
+python3 arxiv_digest/Arxiv_filter.py --no-extra-sources      # 跳过 HF/OpenAlex/S2
+```
+
 ### 调参
 
-| 参数               | 默认值 | 作用                       |
-| ------------------ | ------ | -------------------------- |
-| `MIN_SCORE`      | 5      | 初筛门槛，越低越多         |
-| `MAX_PAPERS`     | 15     | 主 digest 最多显示几篇     |
-| `MAX_OCS_PAPERS` | 10     | OCS spotlight 最多显示几篇 |
+| 参数                       | 默认值 | 作用                                  |
+| -------------------------- | ------ | ------------------------------------- |
+| `MIN_SCORE`                | 5      | 主 digest 初筛门槛，越低越多          |
+| `MAX_PAPERS`               | 15     | 主 digest 最多显示几篇                |
+| `TITLE_BOOST`              | 0.5    | 标题命中额外权重（核心工作在标题点题） |
+| `CORE_PICK_MIN`            | 16     | 标 ★ core pick 的 core_score 门槛     |
+| `OCS_MIN_SCORE`            | 6      | OCS software / neutral 论文门槛       |
+| `OCS_MIXED_MIN_SCORE`      | 10     | 软件/器件信号混合论文的门槛           |
+| `OCS_HARDWARE_MIN_SCORE`   | 12     | 纯器件论文进入 spotlight 的更高门槛   |
+| `OCS_HARDWARE_WEIGHT`      | 0.35   | 器件/物理词权重                       |
+| `MAX_OCS_HARDWARE`         | 2      | OCS spotlight 器件论文上限            |
+| `MAX_OCS_PAPERS`           | 10     | OCS spotlight 最多显示几篇            |
+| `SUMMARY_MAX_CHARS`        | 2400   | digest 摘要最大字符数（默认全文）     |
+| `CATEGORY_FILTERS`         | 见 config | 对 cs.LG / physics.optics 等大分类加兴趣约束 |
+
+**分类**：`cs.NI`, `cs.DC`, `cs.AR`, `cs.PF`, `cs.LG`, `cs.ET`,
+`physics.optics`, `physics.app-ph`, `eess.SP`。`cs.AI` 已移除（泛 AI 噪声），
+`cs.LG` / `cs.ET` 用于补 ML systems 和光互连；`CATEGORY_FILTERS` 会对
+`cs.LG`、`physics.optics` 等大分类加 `abs:"..."` 兴趣约束，减少无效抓取。
+
+**额外源开关**：
+
+```bash
+python3 arxiv_digest/Arxiv_filter.py --no-extra-sources   # 只跑 arXiv
+export SEMANTIC_SCHOLAR_API_KEY="..."                     # 启用 S2 发现/enrichment
+```
+
 
 ### 校园网 / 受限网络（SJTU）说明
 
@@ -128,13 +190,20 @@ python3 arxiv_digest/Arxiv_filter.py --send
 | 主机                       | 状态              | 说明                             |
 | -------------------------- | ----------------- | -------------------------------- |
 | `export.arxiv.org`（API）  | ❌ 被封 / 429 限流 | 传统 API 接口，校园网基本不可用  |
-| `arxiv.org/search/`        | ❌ 超时            | 动态搜索页被限流                 |
+| `arxiv.org/search/advanced` | ⚠️ 时好时坏       | 高级搜索页，支持日期范围/摘要；会被限流 |
 | `arxiv.org`（abs / list）  | ✅ 可用            | 主页、摘要页、列表页均正常       |
 | `cn.arxiv.org`             | ✅ 可用            | 国内镜像                         |
+| `openalex.org`             | ✅ 通常可用        | 无 key bibliographic 回退        |
+| `huggingface.co`           | ✅ 通常可用        | HF Daily Papers（可选源）        |
+| `api.semanticscholar.org`  | ⚠️ 匿名常 429      | 配 API key 后稳定                |
 
-因此抓取在 API 返回 0 条时会**自动回退**到 HTML 搜索页（`arxiv.org/search/`）解析，
-而不是直接判定"今天没有论文"。开关是 `ARXIV_HTML_FALLBACK`。
-若该搜索页在你所在网络同样超时，请把 `ARXIV_API_BASE_URL` 指向可用镜像。
+因此抓取在 API 失败时会**自动回退**到 `arxiv.org/search/advanced`，使用真实
+日期范围按主题查询（光网络、LLM inference、MoE、集合通信、RDMA），并解析
+完整摘要/作者/主分类。开关是 `ARXIV_HTML_FALLBACK`；查询列表是
+`ARXIV_HTML_FALLBACK_QUERIES`。如果高级搜索也被限流，OpenAlex 会按
+日期 + 主题提供第三路结果；HF Daily Papers 同时作为独立的 ML systems 源。
+若所有 arXiv 路径都不可用且没有额外源结果，程序会明确失败（退出码 2），
+而不是写一个空 digest。
 
 **改用镜像**：在 `config.py` 里改这三个基址即可（默认走官方域名）：
 

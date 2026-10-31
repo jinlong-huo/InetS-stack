@@ -8,19 +8,23 @@ Pipeline:  fetch → filter → select → digest
 Usage:
     python3 arxiv_digest/Arxiv_filter.py                日常运行（抓取 + 生成 digest）
     python3 arxiv_digest/Arxiv_filter.py --wait          遇到 429 限流时等待 5 分钟后自动重试
-    python3 arxiv_digest/Arxiv_filter.py --date YYYY-MM-DD  回填指定日期的论文（如 --date 2026-07-10）
+    python3 arxiv_digest/Arxiv_filter.py --date YYYY-MM-DD  回填指定日期（精确窗口；
+                                                          HTML 回退会自动多看 1 天时区差）
     python3 arxiv_digest/Arxiv_filter.py --from YYYY-MM-DD [--to YYYY-MM-DD]
-                                                          补拉一段时间内的论文（长时间未运行后用，
-                                                          如 --from 2026-07-01 --to 2026-08-17）
+                                                          补拉一段时间内的论文（长时间未运行后用）
     python3 arxiv_digest/Arxiv_filter.py --ignore-seen   忽略 digest 历史重新打分
-                                                          （配合 --from/--to 重评某段时期）
+    python3 arxiv_digest/Arxiv_filter.py --no-extra-sources
+                                                          只用 arXiv，跳过 HF / OpenAlex / S2
 
-默认日常模式 = 最近 3 天窗口 + 自动回看窗口（防漏跑 / arXiv 延迟上架）。
-matched 但被 top-N 挤掉的高分论文记入 pending，7 天内分数 ≥ 12 者
-通过 "High-Score Carry-Over" 板块补遗。
+数据源：arXiv API → （失败时）arxiv.org advanced search HTML → HF Daily Papers
+→ OpenAlex（无 key 的 bibliographic 回退）→ Semantic Scholar（有 key 时）。
+每个源的失败都写入 arxiv_digest/fetch_report.json；全部失败时退出码为 2，
+不会生成一个看起来正常的空 digest。
 """
 
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Ensure the project root is on sys.path so `arxiv_digest` is importable
@@ -33,6 +37,7 @@ from arxiv_digest import config
 from arxiv_digest import fetch
 from arxiv_digest import filter as flt
 from arxiv_digest import digest
+from arxiv_digest import extra_sources
 
 
 def _arg_value(flag):
@@ -81,6 +86,35 @@ def _parse_range_args():
     return range_from, range_to
 
 
+def _entry_fields(entry):
+    """Extract the fields the digest needs, independent of the source."""
+    authors = flt.extract_authors(entry)
+    summary = (getattr(entry, "summary", "") or "").strip()
+    link = getattr(entry, "link", "") or ""
+    pdf_link = link.replace("/abs/", "/pdf/") if "arxiv.org/abs/" in link else ""
+    first_author, year = flt.extract_author_year(entry)
+    return {
+        "title": getattr(entry, "title", "") or "",
+        "authors": authors,
+        "first_author": first_author,
+        "year": year,
+        "summary": summary,
+        "link": link,
+        "pdf_link": pdf_link,
+        "primary_category": flt.extract_primary_category(entry),
+        "published": flt.extract_published(entry),
+        "source": getattr(entry, "source", "arxiv"),
+        "arxiv_comment": getattr(entry, "arxiv_comment", "") or "",
+        "hf_upvotes": getattr(entry, "hf_upvotes", None),
+        "hf_url": getattr(entry, "hf_url", "") or "",
+        "hf_ai_summary": getattr(entry, "hf_ai_summary", "") or "",
+        "citation_count": getattr(entry, "s2_citations", None),
+        "influential_citations": getattr(entry, "s2_influential", None),
+        "venue": getattr(entry, "s2_venue", "") or "",
+        "s2_tldr": getattr(entry, "s2_tldr", "") or "",
+    }
+
+
 def _carry_over_eligible(prev, score, today):
     """pending（matched 但被 top-N 挤掉）论文是否达到补遗条件：
     本次分数 ≥ RESURFACE_MIN_SCORE 且首次 matched 日期在 RESURFACE_DAYS 天内。"""
@@ -125,15 +159,27 @@ def evaluate_entries(entries_by_cat, today, seen, digest_seen, stats,
 
         for entry in entries:
             paper_id = flt.normalize_arxiv_id(entry.id)
+            run_key = flt.base_arxiv_id(entry.id)
+            source = getattr(entry, "source", "arxiv")
 
-            # 跨 feed 去重（同次运行内）
-            if paper_id in seen_this_run:
+            # 拒绝 OpenAlex/HTML 解析出的畸形 arXiv ID（例如 2026.9150015），
+            # 否则 digest 里会出现打不开的链接。S2 的非 arXiv 条目用 s2: id，
+            # 不受此限制。
+            if (source != "semantic-scholar"
+                    and "arxiv.org" in (getattr(entry, "link", "") or "")
+                    and not flt.valid_arxiv_id(entry.id)):
                 feed_skipped += 1
                 counts["skipped"] += 1
                 continue
-            seen_this_run.add(paper_id)
 
-            prev = digest_seen.get(paper_id)
+            # 跨 feed / 跨源去重（同次运行内；忽略 v1/v2 差异）
+            if run_key in seen_this_run:
+                feed_skipped += 1
+                counts["skipped"] += 1
+                continue
+            seen_this_run.add(run_key)
+
+            prev = digest_seen.get(paper_id) or digest_seen.get(run_key)
             # 旧格式条目无 shown 字段 → 视为已上过 digest
             prev_shown = prev is None or prev.get("shown", True)
             prev_date = prev.get("date", "") if prev else ""
@@ -141,13 +187,18 @@ def evaluate_entries(entries_by_cat, today, seen, digest_seen, stats,
             title = entry.title
             summary = entry.summary
             link = entry.link
-            first_author, year = flt.extract_author_year(entry)
+            fields = _entry_fields(entry)
 
-            # ── 主过滤器 ──
-            score, max_single, matched = flt.score_main(title, summary)
+            # ── 主过滤器（含 core / innovation 信号）──
+            main = flt.score_main_detail(title, summary)
+            score = main["score"]
+            max_single = main["max_single"]
+            matched = main["matched"]
 
-            # ── OCS 过滤器 ──
-            ocs_score, ocs_matched = flt.score_ocs(title, summary)
+            # ── OCS 过滤器（software / hardware 分流）──
+            ocs = flt.score_ocs_detail(title, summary)
+            ocs_score = ocs["score"]
+            ocs_matched = ocs["matched"]
 
             # ── 跨天去重 / 补遗门 ──
             if not ignore_seen and prev is not None and prev_date != today:
@@ -159,10 +210,14 @@ def evaluate_entries(entries_by_cat, today, seen, digest_seen, stats,
                 # pending：高分 → carry-over 补遗；低分 → 继续跳过（保留 pending）
                 if _carry_over_eligible(prev, score, today):
                     carry_over.append({
+                        **fields,
                         "title": title, "score": score,
                         "max_single": max_single, "matched": matched,
-                        "link": link, "first_author": first_author,
-                        "year": year, "summary": summary[:400],
+                        "matched_detail": main["matched_detail"],
+                        "core_score": main["core_score"],
+                        "rank_score": main["rank_score"],
+                        "core_pick": main["core_pick"],
+                        "innovation_matched": main["innovation_matched"],
                         "first_seen": prev_date,
                     })
                 else:
@@ -174,6 +229,12 @@ def evaluate_entries(entries_by_cat, today, seen, digest_seen, stats,
                     "keywords": matched[:3],
                     "ocs_keywords": ocs_matched[:3],
                     "score": score,
+                    "core_score": main["core_score"],
+                    "rank_score": main["rank_score"],
+                    "core_pick": main["core_pick"],
+                    "ocs_focus": ocs["focus"],
+                    "ocs_software": ocs["software_score"],
+                    "ocs_hardware": ocs["hardware_score"],
                 }
                 continue
 
@@ -182,32 +243,49 @@ def evaluate_entries(entries_by_cat, today, seen, digest_seen, stats,
             # 两次过滤器均未命中 → 零关键词，单独记录供复查
             if score == 0 and ocs_score == 0:
                 no_kw_papers.append({
-                    "title": title, "link": link,
-                    "first_author": first_author, "year": year,
-                    "summary": summary[:300],
+                    **fields,
+                    "summary": summary[:500],
                 })
 
             if score >= config.MIN_SCORE:
                 selected.append({
+                    **fields,
                     "title": title, "score": score,
                     "max_single": max_single, "matched": matched,
-                    "link": link, "first_author": first_author,
-                    "year": year, "summary": summary[:400],
+                    "matched_detail": main["matched_detail"],
+                    "core_score": main["core_score"],
+                    "title_score": main["title_score"],
+                    "innovation_bonus": main["innovation_bonus"],
+                    "innovation_matched": main["innovation_matched"],
+                    "rank_score": main["rank_score"],
+                    "core_pick": main["core_pick"],
                 })
                 feed_selected += 1
             elif score >= config.MIN_SCORE - 2:
                 near_misses.append({
                     "title": title, "score": score,
                     "max_single": max_single, "matched": matched,
+                    "core_score": main["core_score"],
+                    "rank_score": main["rank_score"],
                     "link": link,
                 })
 
-            if ocs_score >= config.OCS_MIN_SCORE:
+            if ocs["focus"] == "hardware":
+                ocs_min = config.OCS_HARDWARE_MIN_SCORE
+            elif ocs["focus"] == "mixed":
+                ocs_min = config.OCS_MIXED_MIN_SCORE
+            else:
+                ocs_min = config.OCS_MIN_SCORE
+            if ocs_score >= ocs_min:
                 ocs_selected.append({
+                    **fields,
                     "title": title, "score": ocs_score,
                     "matched": ocs_matched,
-                    "link": link, "first_author": first_author,
-                    "year": year, "summary": summary[:400],
+                    "matched_detail": ocs["matched_detail"],
+                    "software_score": ocs["software_score"],
+                    "hardware_score": ocs["hardware_score"],
+                    "focus": ocs["focus"],
+                    "rank_score": ocs["rank_score"],
                 })
                 feed_ocs_selected += 1
 
@@ -220,7 +298,7 @@ def evaluate_entries(entries_by_cat, today, seen, digest_seen, stats,
 
             # 台账：matched 者先记为 pending（shown=False），
             # 待 top-N 选择后由 finalize_stamps 把实际展示者置 True
-            if score >= config.MIN_SCORE or ocs_score >= config.OCS_MIN_SCORE:
+            if score >= config.MIN_SCORE or ocs_score >= ocs_min:
                 new_digest_seen[paper_id] = {
                     "title": title,
                     "keywords": matched[:3],
@@ -228,6 +306,12 @@ def evaluate_entries(entries_by_cat, today, seen, digest_seen, stats,
                     "date": today,
                     "shown": False,
                     "score": score,
+                    "core_score": main["core_score"],
+                    "rank_score": main["rank_score"],
+                    "core_pick": main["core_pick"],
+                    "ocs_focus": ocs["focus"],
+                    "ocs_software": ocs["software_score"],
+                    "ocs_hardware": ocs["hardware_score"],
                 }
 
         # 更新该分类的统计
@@ -251,45 +335,99 @@ def evaluate_entries(entries_by_cat, today, seen, digest_seen, stats,
 
 def main():
     do_wait = "--wait" in sys.argv
+    exact_date = None
 
-    # ── --date YYYY-MM-DD：回填指定日期的论文 ──
+    # ── --date YYYY-MM-DD：只抓这一天（不是最近 3 天）──
     if "--date" in sys.argv:
         idx = sys.argv.index("--date")
         if idx + 1 < len(sys.argv):
             date_arg = sys.argv[idx + 1]
-            # Validate format
             try:
-                from datetime import datetime as _dt
-                _dt.strptime(date_arg, "%Y-%m-%d")
+                datetime.strptime(date_arg, "%Y-%m-%d")
             except ValueError:
                 print(f"[error] Invalid date format: {date_arg}. Use YYYY-MM-DD.")
-                return
+                raise SystemExit(2)
             config.DATE_OVERRIDE = date_arg
-            print(f"[backfill] Targeting date: {date_arg}")
+            exact_date = date_arg
+            print(f"[backfill] Targeting exact date: {date_arg}")
         else:
             print("[error] --date requires a value: --date YYYY-MM-DD")
-            return
+            raise SystemExit(2)
 
-    # ── --from / --to：区间回填（优先于 --date 的 3 天窗口）──
+    # ── --from / --to：区间回填（优先于 --date）──
     range_from, range_to = _parse_range_args()
     if range_from is False:
-        return
+        raise SystemExit(2)
+    if range_from is None and range_to is None and exact_date:
+        range_from = range_to = exact_date
 
     # ── Stage 1: Fetch ─────────────────────────────────────
     print("Fetching from arXiv...")
-    entries_by_cat, stats = fetch.fetch_all(wait_on_429=do_wait,
-                                            date_from=range_from,
-                                            date_to=range_to)
+    fetch_report = {}
+    entries_by_cat, stats = fetch.fetch_all(
+        wait_on_429=do_wait, date_from=range_from, date_to=range_to,
+        report=fetch_report)
+
+    # ── Optional discovery sources: HF Daily Papers / Semantic Scholar ──
+    extra = {"entries": [], "hf_entries": [], "s2_entries": [],
+             "openalex_entries": [], "report": {}}
+    if "--no-extra-sources" not in sys.argv:
+        try:
+            d_from = datetime.strptime(fetch_report["date_from"], "%Y-%m-%d").date()
+            d_to = datetime.strptime(fetch_report["date_to"], "%Y-%m-%d").date()
+        except (KeyError, TypeError, ValueError):
+            d_from = d_to = config.bj_now().date()
+        print("\nFetching optional sources (Hugging Face / Semantic Scholar)...")
+        try:
+            extra = extra_sources.collect(d_from, d_to)
+        except Exception as ex:  # discovery must never break the digest
+            print(f"  [extra] disabled after error: {ex}")
+            extra["report"]["fatal_error"] = str(ex)
+        s2 = extra.get("report", {}).get("semantic_scholar", {})
+        if s2 and not s2.get("enabled"):
+            print(f"  [s2] {s2.get('reason', 'disabled')}")
+
+    for source, source_entries in extra.get("entries", []):
+        entries_by_cat.append((source, source_entries))
+        stats[source] = {
+            "total": len(source_entries), "skipped": 0, "already_seen": 0,
+            "selected": 0, "ocs_selected": 0,
+        }
+
+    fetch_report["extra_sources"] = extra.get("report", {})
+    try:
+        config.FETCH_REPORT_FILE.write_text(
+            json.dumps(fetch_report, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+    except OSError:
+        pass
 
     total_in_feeds = sum(s["total"] for s in stats.values())
     if total_in_feeds == 0:
-        # CRITICAL: 所有分类均返回 0
-        print("=" * 60)
-        print("⚠️  CRITICAL: arXiv API returned 0 entries for ALL categories.")
-        print("    This is almost certainly rate-limiting or an API outage.")
-        print("    Digest will be empty — check logs and try again later.")
-        print("=" * 60)
+        failed_fetch = (fetch_report.get("fatal")
+                        or not fetch_report.get("ok_categories"))
+        if failed_fetch:
+            print("=" * 60)
+            print("⚠️  CRITICAL: no usable entries and no healthy arXiv "
+                  "category.")
+            print("    This is a fetch failure, not an empty arXiv day.")
+            print(f"    Per-category report: {config.FETCH_REPORT_FILE}")
+            print("=" * 60)
+            raise SystemExit(2)
+        print("[skip] No new papers in the selected window "
+              "(all categories returned a valid empty feed).")
         return
+    if fetch_report.get("fatal") and not extra.get("entries"):
+        print("=" * 60)
+        print("⚠️  CRITICAL: every arXiv category failed and no fallback "
+              "returned papers.")
+        print(f"    Per-category report: {config.FETCH_REPORT_FILE}")
+        print("=" * 60)
+        raise SystemExit(2)
+    if fetch_report.get("degraded"):
+        failed = ", ".join(fetch_report.get("failed_categories", []))
+        print(f"[warn] Degraded fetch: {failed}. Continuing with the "
+              f"categories/sources that did return data.")
 
     # ── Stage 2: Filter ────────────────────────────────────
     print(f"Filtering {total_in_feeds} entries...")
@@ -315,10 +453,28 @@ def main():
     # ── Stage 3: Select ────────────────────────────────────
     selected, total_main = digest.select_top(result["selected"],
                                              config.MAX_PAPERS)
-    ocs_selected, total_ocs = digest.select_top(result["ocs_selected"],
-                                                config.MAX_OCS_PAPERS)
+    ocs_selected, total_ocs = digest.select_ocs(
+        result["ocs_selected"], config.MAX_OCS_PAPERS,
+        config.MAX_OCS_HARDWARE)
     carry_over, total_carry = digest.select_top(result["carry_over"],
                                                 config.MAX_RESURFACED)
+
+    # ── Optional metadata: HF upvotes, S2 citations/TLDR ──
+    enrich_report = {}
+    if "--no-extra-sources" in sys.argv:
+        enrich_report["skipped"] = "disabled by --no-extra-sources"
+    else:
+        try:
+            extra_sources.enrich_papers(
+                selected + ocs_selected + carry_over,
+                hf_entries=extra.get("hf_entries"),
+                s2_entries=extra.get("s2_entries"),
+                openalex_entries=extra.get("openalex_entries"),
+                report=enrich_report)
+        except Exception as ex:  # enrichment is never allowed to break digest
+            print(f"[warn] enrichment skipped: {ex}")
+            enrich_report["error"] = str(ex)
+    fetch_report["enrichment"] = enrich_report
 
     # 实际展示者置 shown=True，其余 matched 保持 pending
     digest.finalize_stamps(new_digest_seen, selected, ocs_selected,
@@ -387,12 +543,25 @@ def main():
                 return
         print("[skip] No papers matched and no existing digest to fall back "
               "on — nothing to send. This may be a rate-limit or API outage.")
+        if fetch_report.get("fatal"):
+            raise SystemExit(2)
         return
 
     # ── Stage 4: Digest ────────────────────────────────────
+    notes = []
+    if fetch_report.get("degraded"):
+        failed = ", ".join(fetch_report.get("failed_categories", []))
+        notes.append(f"Fetch degraded: {failed} failed; remaining sources "
+                     f"are shown. See fetch_report.json.")
     digest.generate_markdown(selected, ocs_selected, total_main, total_ocs,
-                             carry_over)
+                             carry_over, notes=notes)
     digest.print_results(selected, ocs_selected, carry_over)
+    try:
+        config.FETCH_REPORT_FILE.write_text(
+            json.dumps(fetch_report, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+    except OSError:
+        pass
     print(f"Saved to {config.OUTPUT_FILE}")
 
 

@@ -14,8 +14,8 @@ run: ## Run arXiv daily digest (fetch + filter + digest)
 wait: ## Run with auto-retry on 429 rate-limit (5 min wait)
 	python3 arxiv_digest/Arxiv_filter.py --wait
 
-test: ## Run offline tests (subfolder routing + catch-up + download verify + vault seed)
-	python3 arxiv_digest/test_classify.py && python3 arxiv_digest/test_catchup.py && python3 arxiv_digest/test_verify.py && python3 sync/test_seed.py
+test: ## Run offline tests (fetch + scoring + sources + routing + catch-up + verify + vault seed)
+	python3 arxiv_digest/test_fetch.py && python3 arxiv_digest/test_filter.py && python3 arxiv_digest/test_sources.py && python3 arxiv_digest/test_classify.py && python3 arxiv_digest/test_catchup.py && python3 arxiv_digest/test_verify.py && python3 sync/test_seed.py
 
 all: ## Full run: filter + download PDFs + rename
 	python3 arxiv_digest/Arxiv_filter.py && make download

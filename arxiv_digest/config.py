@@ -56,10 +56,30 @@ ARXIV_API_BASE_URL = "https://export.arxiv.org"   # legacy API endpoint
 ARXIV_ABS_BASE_URL = "https://arxiv.org"           # abs / PDF base
 ARXIV_LIST_BASE_URL = "https://arxiv.org"          # list-page base (always accessible from CN)
 
-# When True and the API returns 0 entries for a category (e.g. rate-limited
-# or blocked), fall back to scraping the arxiv.org HTML listing/search pages
-# (separate CDN, usually reachable from China).  Read by fetch.fetch_all().
+# When True and the API fails/returns 0 entries for a category (e.g.
+# rate-limited or blocked), fall back to arxiv.org's advanced-search HTML.
+# The HTML endpoint is on separate infrastructure and supports real date
+# ranges, full abstracts, authors and primary categories.
 ARXIV_HTML_FALLBACK = True
+ARXIV_HTML_PAGE_SIZE = 50
+ARXIV_HTML_MAX_RESULTS = 150
+ARXIV_HTML_BREAKER_AFTER = 3   # 连续 N 个 HTML 查询失败后停止，交给 OpenAlex/HF
+ARXIV_HTML_LOOKBACK_DAYS = 1   # 时区/提交日期跨日：回退时多看一天，避免漏掉目标日论文
+# Topic queries used by the HTML fallback.  They are intentionally phrased
+# around the group's interests instead of "all of arXiv": a full 3-day dump is
+# both slow and impossible to paginate reliably when the API is throttled.
+ARXIV_HTML_FALLBACK_QUERIES = [
+    '"optical network"',
+    '"optical interconnect"',
+    '"optical circuit switch"',
+    '"optical datacenter"',
+    '"datacenter network"',
+    '"LLM inference"',
+    '"mixture of experts"',
+    '"collective communication"',
+    '"RDMA"',
+    '"co-packaged optics"',
+]
 
 # ── PDF download robustness ────────────────────────────────────
 #
@@ -85,15 +105,32 @@ ARXIV_PDF_FALLBACK_HOSTS = []
 # ── arXiv API ──────────────────────────────────────────────────
 
 CATEGORIES = [
-    "cs.NI",
-    "cs.DC",
-    "cs.AR",
-    "cs.PF",
-    "cs.AI",
-    "physics.optics",   # device/hardware OCS papers live here, not cross-listed to cs.*
-    "physics.app-ph",   # applied physics — optical device / photonic integration
-    "eess.SP",          # signal processing — optical comms / fiber transmission
+    "cs.NI",            # networking — OCS/DCN, RDMA, collective communication
+    "cs.DC",            # distributed systems — LLM serving, training systems
+    "cs.AR",            # architecture — GPU/NPU, interconnects, near-memory compute
+    "cs.PF",            # performance — serving/network measurement
+    "cs.LG",            # ML systems — inference/serving papers cross-list here
+    "cs.ET",            # emerging tech — optical computing / interconnect
+    "physics.optics",   # photonics — OCS devices and optical fabrics
+    "physics.app-ph",   # applied physics — photonic integration / CPO
+    "eess.SP",          # signal processing — optical transmission / DSP
 ]
+
+# 对“大而杂”的分类加一个兴趣约束，避免每天先拉 200 篇纯理论/器件论文
+# 再用关键词筛选。空字符串 = 不额外约束。
+# 语法是 arXiv API 的 search_query（可与 cat: 用 AND 连接）。
+CATEGORY_FILTERS = {
+    "cs.LG": ('(abs:"LLM" OR abs:"language model" OR abs:"inference" '
+              'OR abs:"mixture of experts" OR abs:"serving")'),
+    "cs.ET": '(abs:"optical" OR abs:"photonic" OR abs:"interconnect")',
+    "physics.optics": ('(abs:"optical network" OR abs:"optical interconnect" '
+                       'OR abs:"optical switch" OR abs:"optical datacenter" '
+                       'OR abs:"optical circuit" OR abs:"co-packaged optics" '
+                       'OR abs:"photonic network")'),
+    "physics.app-ph": ('(abs:"optical" OR abs:"photonic" OR abs:"co-packaged" '
+                       'OR abs:"interconnect")'),
+    "eess.SP": '(abs:"optical" OR abs:"datacenter" OR abs:"data center")',
+}
 
 MAX_PER_CATEGORY = 200
 API_DELAY = 5.0
@@ -101,6 +138,42 @@ RETRY_BACKOFF_BASE = [20.0, 60.0]       # 解析错误退避
 RETRY_BACKOFF_503_BASE = [60.0, 120.0]  # 503 服务端故障退避（更长，尊重 arXiv 恢复时间）
 MAX_RETRIES = 2
 MAX_429_RETRIES = 3                     # --wait 模式下每页 429 冷却重试上限（每次 ~5min）
+ARXIV_REQUEST_TIMEOUT = 20              # API/HTML socket timeout (seconds)
+ARXIV_BREAKER_AFTER = 3                 # 连续 N 个分类失败后停止打 API，直接走 HTML
+
+# 额外推荐源（都不阻塞主流程；失败只降级，不会生成空 digest）
+ENABLE_HF_DAILY = True                  # Hugging Face Daily Papers
+HF_DAILY_URL = "https://huggingface.co/api/daily_papers"
+HF_DAILY_MAX_PAPERS = 50
+HF_DAILY_TIMEOUT = 20
+
+# Semantic Scholar 需要 API key 才稳定（匿名请求经常 429）。
+# 设置 SEMANTIC_SCHOLAR_API_KEY 后才会启用 discovery / enrichment。
+ENABLE_SEMANTIC_SCHOLAR = True
+SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1"
+SEMANTIC_SCHOLAR_QUERIES = [
+    "optical datacenter network",
+    "optical circuit switching",
+    "LLM inference serving",
+    "mixture of experts inference",
+]
+SEMANTIC_SCHOLAR_LIMIT = 40
+SEMANTIC_SCHOLAR_TIMEOUT = 30
+
+# OpenAlex 是无 key 的 bibliographic 源；在 arXiv API/search 都被限流时，
+# 它仍能按日期 + 主题返回标题、完整摘要、作者和 arXiv 链接。
+# 免费额度是共享的，所以只发少量查询，失败静默降级。
+ENABLE_OPENALEX = True
+OPENALEX_API = "https://api.openalex.org/works"
+OPENALEX_QUERIES = [
+    "optical datacenter network",
+    "optical interconnect",
+    "LLM inference serving",
+    "mixture of experts inference",
+]
+OPENALEX_LIMIT = 100
+OPENALEX_TIMEOUT = 30
 
 # ── 区间回填（--from / --to）───────────────────────────────────
 RANGE_WINDOW_DAYS = 3   # 每个拉取窗口的天数（含端点），逐窗口分页拉取
@@ -170,6 +243,16 @@ KEYWORDS = {
     "parallelism": 3,
     "network": 7,
     "memory": 2,
+    # 光互连 / 光网络（系统方向；具体光学短语才计分，避免泛 "optical" 噪声）
+    "optical network": 5,
+    "optical interconnect": 5,
+    "optical datacenter": 6,
+    "optical data center": 6,
+    "optical circuit switch": 6,
+    "optical circuit switching": 6,
+    "direct-connect optical": 6,
+    "co-packaged optics": 5,
+    "silicon photonics": 4,
     # LLM serving 系统 / 推理优化（高优先级 — CacheRoute 类）
     "prefix caching": 8,
     "prefix cache": 7,
@@ -203,16 +286,97 @@ KEYWORDS = {
 }
 
 NEGATIVE_KEYWORDS = {
-    "a survey": -2,
-    "survey paper": -2,
-    "comprehensive survey": -2,
-    "this survey": -6,
+    # 综述 / 教程 / 观点类：不是“core”贡献，压到主榜之外
+    "a survey": -4,
+    "survey": -4,
+    "survey paper": -4,
+    "comprehensive survey": -4,
+    "this survey": -8,
+    "systematic review": -8,
+    "literature review": -6,
+    "a review": -4,
+    "review paper": -4,
+    "this review": -6,
+    "an overview": -3,
+    "overview paper": -4,
+    "position paper": -4,
+    "vision paper": -4,
+    "research agenda": -4,
     "tutorial": -6,
     "benchmark dataset": -6,
+    "comparative analysis": -4,
+    "comparative study": -3,
+    "decision framework": -3,
+}
+
+# ── 核心 / 创新排序（filter.py）────────────────────────────────
+# 目标：优先“点明问题 + 给出新系统/算法”的论文，而不是关键词堆满的论文。
+TITLE_BOOST = 0.5          # 标题命中额外 +50%（四舍五入，至少 +1）
+INNOVATION_BONUS_CAP = 6   # “we propose ... / novel / prototype” 加分封顶
+CORE_PICK_MIN = 16         # core_score ≥ 此值 → 标 ★ core pick
+CORE_RANK_WEIGHT = 0.5     # 排序分 = score + 0.5 * core_score
+
+INNOVATION_KEYWORDS = {
+    # 明确的贡献措辞（摘要里出现）
+    "we propose": 3,
+    "we present": 2,
+    "we introduce": 2,
+    "we design": 2,
+    "we build": 2,
+    "we develop": 2,
+    "we demonstrate": 1,
+    # 系统 / 实现信号（低权重，避免泛词刷分）
+    "novel": 2,
+    "architecture": 1,
+    "framework": 1,
+    "algorithm": 1,
+    "prototype": 1,
+    "testbed": 1,
+    "deployment": 1,
+    "open-source": 1,
+    "end-to-end": 1,
+}
+
+# 同义词族：同一概念只计一次（取族内最高权重），避免 MoE/KV-cache 术语堆分。
+MAIN_KEYWORD_FAMILIES = {
+    "moe": ["mixture of experts", "mixture-of-experts", "moe", "sparse mixture",
+            "moe model", "moe layer", "expert parallelism", "expert routing"],
+    "prefix_cache": ["prefix caching", "prefix cache", "prefix-aware",
+                     "prefix affinity", "prefix-affinity", "kv cache reuse",
+                     "cache-aware routing"],
+    "disaggregation": ["disaggregated serving", "disaggregation",
+                       "pd disaggregation", "prefill-decode"],
+    "collective": ["collective communication", "all-reduce", "allreduce",
+                   "nccl", "rccl"],
+    "gpudirect": ["gpu direct", "gpudirect"],
+    "ttft": ["time to first token", "ttft"],
+    "tpot": ["time per output token", "tpot"],
+    "routing": ["request routing", "model routing", "llm router"],
+    "agents": ["agentic", "ai agent"],
+    "optical": ["optical network", "optical interconnect", "optical datacenter",
+                "optical data center", "optical circuit switch",
+                "optical circuit switching", "direct-connect optical",
+                "co-packaged optics", "silicon photonics"],
+}
+
+# 标题里必须出现一个“核心领域锚点”，才算 core pick；
+# 否则 “Scheduling in Cloud/Fog/Edge” 这类泛调度标题会被误判为核心。
+CORE_MAIN_KEYWORDS = {
+    "llm", "large language model", "inference", "serving", "kv cache",
+    "prefill", "decode", "moe", "mixture of experts", "mixture-of-experts",
+    "expert parallelism", "disaggregation", "disaggregated", "rdma",
+    "datacenter", "data center", "gpu", "collective communication",
+    "prefix cache", "prefix caching", "request routing", "model routing",
+    "speculative decoding", "goodput", "ttft", "tpot", "agentic", "ai agent",
+    "optical network", "optical interconnect", "optical datacenter",
+    "optical data center", "optical circuit switch", "optical circuit switching",
+    "direct-connect optical", "co-packaged optics", "silicon photonics",
 }
 
 MIN_SCORE = 5
 MAX_PAPERS = 15
+SUMMARY_MAX_CHARS = 2400   # digest 保留完整摘要（arXiv 摘要通常 < 2k 字符）
+DIGEST_MAX_AUTHORS = 8     # 作者太多时显示前 N 位 + et al.
 
 # ── OCS / 光交换 关键词（独立过滤器）────────────────────────────
 
@@ -374,7 +538,177 @@ OCS_NEGATIVE_KEYWORDS = {
     "optical image": -4,
 }
 
-OCS_MIN_SCORE = 3
+# ── OCS 软件 / 硬件分流 ────────────────────────────────────────
+# 组里的 OCS 工作以软件为主：控制面、调度、路由、重配置算法优先；
+# 纯器件/物理（硅光、WSS、MEMS、调制器、光纤）降权，但不驱逐。
+OCS_SOFTWARE_TERMS = {
+    "topology engineering", "topology reconfiguration", "reconfigurable topology",
+    "reconfigurable network", "optical reconfiguration",
+    "optical network optimization", "optical network automation",
+    "machine learning optical network", "reinforcement learning optical",
+    "llm optical network", "optical network planning", "optical scheduling",
+    "optical resource allocation", "digital twin optical",
+    "optical network control", "software-defined optical", "sdn optical",
+    "optical network security", "optical network survivability",
+    "optical network resilience", "quality of transmission",
+    "optical performance monitoring",
+    # 系统可靠性 / 故障恢复 / 集合通信重映射（OMRC 这类工作）
+    "optical datacenter", "optical data center", "direct-connect optical",
+    "direct connect optical", "optical interconnect",
+    "multipath reliable connection", "circuit remapping",
+    "collective remapping", "failure recovery", "optical network reliability",
+    "optical network resilience", "optical network survivability",
+    "collective communication", "circuit reconfiguration",
+}
+OCS_HARDWARE_TERMS = {
+    "wavelength division multiplex", "dense wavelength division", "wdm",
+    "optical mems", "optical cross-connect", "optical cross connect",
+    "reconfigurable optical add-drop", "roadm",
+    "co-packaged optics", "co-packaged optical", "co packaged optics",
+    "co-packaged", "linear pluggable optics", "linear-pluggable optics",
+    "linear receive optics", "near-packaged optics", "optical engine",
+    "external laser source", "elsfp", "optical io chiplet",
+    "optical i/o chiplet", "chiplet optical", "fiber attach unit",
+    "optical transceiver", "silicon photonic", "silicon photonics",
+    "optical i/o", "optical io", "elastic optical network", "flexgrid",
+    "flex grid", "space division multiplex", "multi-core fiber",
+    "multicore fiber", "hollow-core fiber", "hollow core fiber",
+    "anti-resonant fiber", "wavelength selective switch",
+    "wavelength-selective switch", "arrayed waveguide grating",
+    "arrayed-waveguide grating", "micro-ring resonator",
+    "microring resonator", "microresonator", "optical resonator",
+    "mach-zehnder modulator", "mach zehnder modulator",
+    "mach-zehnder interferometer", "optical frequency comb",
+    "frequency comb", "sagnac", "free-space optical", "free space optical",
+    "visible light communication", "optical grid", "flex-rate", "flex rate",
+    "quantum optical network", "entanglement distribution optical",
+}
+OCS_HARDWARE_KEYWORDS = {
+    # 器件 / 物理 / 表征：降权并归入 hardware，避免挤占 software spotlight
+    "non-volatile": 4, "nonvolatile": 4, "composition-engineered": 4,
+    "photonic crystal": 4, "metasurface": 4, "nanophotonic": 4,
+    "nanophotonics": 4, "optomechanical": 4, "lithium tantalate": 4,
+    "thin-film": 3, "cavity": 3, "interferometer": 3, "spectroscopy": 4,
+    "microscopy": 4, "fluorescence": 4, "magnetometry": 4, "sensing": 2,
+    "sensor": 2, "imaging": 2, "holographic": 2, "fabrication": 3,
+    "epitaxial": 3, "wafer": 3, "photodetector": 4, "laser": 2,
+    "modulator": 4, "waveguide": 4, "amplifier": 3, "oscillator": 3,
+    "resonator": 3, "quantum": 2, "single-photon": 4, "photon pair": 4,
+    "entanglement": 3, "spin": 2, "mems": 4, "packaging": 3,
+}
+
+OCS_SOFTWARE_KEYWORDS = {
+    # 控制面 / 编排
+    "control plane": 6, "data plane": 4, "sdn": 5,
+    "software-defined": 6, "orchestration": 6, "controller": 4,
+    "network operating system": 6, "intent-based": 5, "api": 2,
+    "telemetry": 5, "automation": 5,
+    # 调度 / 路由 / 算法
+    "scheduling": 5, "routing": 5, "traffic engineering": 6,
+    "resource allocation": 4, "topology design": 6,
+    "reconfiguration algorithm": 7, "optimization": 3, "planning": 3,
+    "algorithm": 4, "provisioning": 4, "failure recovery": 5,
+    "fault tolerance": 4, "monitoring": 3,
+    # 系统 / 实验
+    "prototype": 4, "testbed": 5, "deployment": 4, "simulation": 3,
+    "emulation": 4,
+    # 可靠性 / 故障 / 重映射（光数据中心系统论文的高信号词）
+    "reliability": 6, "reliable": 3, "failure": 5, "failures": 5,
+    "failure recovery": 6, "fault tolerance": 5, "resilience": 5,
+    "survivability": 4, "remapping": 6, "remap": 5, "circuit remapping": 7,
+    "collective remapping": 7, "collectives": 5, "collective": 4,
+    "multipath": 4, "reliable connection": 5,
+    "direct-connect": 5, "stalled inference": 4, "training throughput": 4,
+    "circuit reconfiguration": 5, "optical circuit": 4,
+    # ML for optics
+    "machine learning": 3, "reinforcement learning": 4,
+    "graph neural": 4, "agent": 3,
+}
+
+OCS_HARDWARE_WEIGHT = 0.35   # 纯硬件词只计 35%：软件优先，但硬件论文不消失
+MAX_OCS_HARDWARE = 2         # OCS spotlight 里纯硬件论文最多占 2 篇
+
+# 通用 software 词（scheduling/routing/optimization/agent…）只有在
+# 明确的光网络语境里才计分，避免把普通物理/器件论文拉进 software。
+OCS_SOFTWARE_CONTEXT_REQUIRED = (
+    "optical circuit switch", "optical circuit switching", "optical switch",
+    "optical switching", "optical network", "optical datacenter",
+    "optical data center", "optical fabric", "optical interconnect",
+    "reconfigurable optical", "optical topology", "topology", "datacenter",
+    "data center",
+)
+
+OCS_KEYWORD_FAMILIES = {
+    "ocs_switch": ["optical circuit switch", "optical circuit switching",
+                   "optical switch", "optical switching", "photonic switch",
+                   "photonic switching"],
+    "ocs_network": ["optical network", "optical data center", "optical datacenter",
+                    "optical data center network", "optical datacenter network",
+                    "optical dcn", "optical fabric", "optical interconnect",
+                    "photonic interconnect", "photonic network",
+                    "all-optical network", "all optical network",
+                    "intra-datacenter optical", "intra-data center optical"],
+    "ocs_cpo": ["co-packaged optics", "co-packaged optical", "co packaged optics",
+                "co-packaged"],
+    "ocs_comb": ["optical frequency comb", "frequency comb"],
+    "ocs_fiber": ["multi-core fiber", "multicore fiber", "hollow-core fiber",
+                  "hollow core fiber", "anti-resonant fiber"],
+    "ocs_fso": ["free-space optical", "free space optical"],
+    "ocs_wdm": ["wavelength division multiplex", "dense wavelength division", "wdm"],
+    "ocs_ml": ["optical network optimization", "optical network automation",
+               "machine learning optical network", "reinforcement learning optical",
+               "llm optical network", "machine learning", "reinforcement learning",
+               "graph neural"],
+    "ocs_sched": ["optical scheduling", "optical resource allocation", "scheduling",
+                  "resource allocation", "planning", "optical network planning"],
+    "ocs_control": ["optical network control", "control plane", "controller",
+                    "orchestration"],
+    "ocs_sdn": ["software-defined optical", "sdn optical", "sdn",
+                "software-defined"],
+    "ocs_topology": ["topology engineering", "topology reconfiguration",
+                     "reconfigurable topology", "reconfigurable network",
+                     "optical topology", "topology design"],
+    "ocs_reconfig": ["reconfigurable optical", "optical reconfiguration",
+                     "reconfiguration algorithm"],
+    "ocs_wss": ["wavelength selective switch", "wavelength-selective switch"],
+    "ocs_awg": ["arrayed waveguide grating", "arrayed-waveguide grating"],
+    "ocs_ring": ["micro-ring resonator", "microring resonator",
+                 "microresonator", "optical resonator"],
+    "ocs_mzm": ["mach-zehnder modulator", "mach zehnder modulator",
+                "mach-zehnder interferometer"],
+    "ocs_roadm": ["roadm", "reconfigurable optical add-drop"],
+    "ocs_xconn": ["optical cross-connect", "optical cross connect"],
+    "ocs_io": ["optical i/o", "optical io"],
+    "ocs_silicon": ["silicon photonic", "silicon photonics"],
+    "ocs_mems": ["optical mems", "mems"],
+    "ocs_laser": ["external laser source", "laser"],
+    "ocs_modulator": ["modulator", "mach-zehnder modulator",
+                      "mach zehnder modulator", "mach-zehnder interferometer"],
+    "ocs_waveguide": ["waveguide", "photonic integrated circuit",
+                      "integrated photonics", "photonic chip", "photonic chiplet"],
+    "ocs_sensing": ["sensing", "sensor", "imaging", "fluorescence",
+                    "spectroscopy", "microscopy"],
+    "ocs_quantum": ["quantum", "single-photon", "photon pair", "entanglement",
+                    "entanglement distribution optical", "quantum optical network"],
+    "ocs_cavity": ["cavity", "resonator", "optical resonator", "microresonator",
+                   "micro-ring resonator", "microring resonator"],
+    "ocs_fab": ["fabrication", "epitaxial", "wafer", "thin-film",
+                "composition-engineered", "non-volatile", "nonvolatile"],
+    "ocs_reliability": ["reliability", "reliable", "failure", "failures",
+                        "failure recovery", "resilience", "survivability",
+                        "fault tolerance", "reliable connection"],
+    "ocs_remap": ["remap", "remaps", "remapping", "circuit remapping",
+                  "collective remapping", "circuit reconfiguration"],
+    "ocs_collective": ["collective", "collectives", "collective communication",
+                       "all-reduce", "allreduce"],
+    "ocs_optical_dc": ["optical datacenter", "optical data center",
+                       "direct-connect optical", "direct connect optical",
+                       "optical interconnect", "direct-connect"],
+}
+
+OCS_MIN_SCORE = 6
+OCS_MIXED_MIN_SCORE = 10    # mixed = 软件/器件信号同时出现，常是误匹配
+OCS_HARDWARE_MIN_SCORE = 12  # 纯器件论文要更高分才进 spotlight
 MAX_OCS_PAPERS = 10
 
 # 需 LLM serving 上下文才生效的缩写（防 "SLO 图优化" 类误匹配）
@@ -689,3 +1023,5 @@ STATE_FILE = SCRIPT_DIR / "seen_papers.json"
 DIGEST_STATE_FILE = SCRIPT_DIR / "digest_papers.json"
 OUTPUT_FILE = SCRIPT_DIR / "daily_digest.md"
 DOWNLOAD_LOG = SCRIPT_DIR / "download_log.json"
+FETCH_REPORT_FILE = SCRIPT_DIR / "fetch_report.json"
+NO_KEYWORD_FILE = SCRIPT_DIR / "no_keyword_papers.json"

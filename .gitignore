@@ -6,6 +6,8 @@ seen_papers.json.bak
 digest_papers.json
 no_keyword_papers.json
 download_log.json
+fetch_report.json
+enrich_cache.json
 
 # 日志
 launchd_stdout.log
